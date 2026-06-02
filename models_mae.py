@@ -28,6 +28,8 @@ class MaskedAutoencoderViT(nn.Module):
                  mlp_ratio=4., norm_layer=nn.LayerNorm, norm_pix_loss=False):
         super().__init__()
 
+        self.in_chans = in_chans
+
         # --------------------------------------------------------------------------
         # MAE encoder specifics
         self.patch_embed = PatchEmbed(img_size, patch_size, in_chans, embed_dim)
@@ -94,30 +96,34 @@ class MaskedAutoencoderViT(nn.Module):
 
     def patchify(self, imgs):
         """
-        imgs: (N, 3, H, W)
-        x: (N, L, patch_size**2 *3)
+        imgs: (N, C, H, W)
+        x: (N, L, patch_size**2 * C)
         """
         p = self.patch_embed.patch_size[0]
         assert imgs.shape[2] == imgs.shape[3] and imgs.shape[2] % p == 0
 
+        c = imgs.shape[1]
+        assert c == self.in_chans
+
         h = w = imgs.shape[2] // p
-        x = imgs.reshape(shape=(imgs.shape[0], 3, h, p, w, p))
+        x = imgs.reshape(shape=(imgs.shape[0], c, h, p, w, p))
         x = torch.einsum('nchpwq->nhwpqc', x)
-        x = x.reshape(shape=(imgs.shape[0], h * w, p**2 * 3))
+        x = x.reshape(shape=(imgs.shape[0], h * w, p**2 * c))
         return x
 
     def unpatchify(self, x):
         """
-        x: (N, L, patch_size**2 *3)
-        imgs: (N, 3, H, W)
+        x: (N, L, patch_size**2 * C)
+        imgs: (N, C, H, W)
         """
         p = self.patch_embed.patch_size[0]
         h = w = int(x.shape[1]**.5)
         assert h * w == x.shape[1]
-        
-        x = x.reshape(shape=(x.shape[0], h, w, p, p, 3))
+
+        c = self.in_chans
+        x = x.reshape(shape=(x.shape[0], h, w, p, p, c))
         x = torch.einsum('nhwpqc->nchpwq', x)
-        imgs = x.reshape(shape=(x.shape[0], 3, h * p, h * p))
+        imgs = x.reshape(shape=(x.shape[0], c, h * p, h * p))
         return imgs
 
     def random_masking(self, x, mask_ratio):
@@ -197,8 +203,8 @@ class MaskedAutoencoderViT(nn.Module):
 
     def forward_loss(self, imgs, pred, mask):
         """
-        imgs: [N, 3, H, W]
-        pred: [N, L, p*p*3]
+        imgs: [N, C, H, W]
+        pred: [N, L, p*p*C]
         mask: [N, L], 0 is keep, 1 is remove, 
         """
         target = self.patchify(imgs)
@@ -228,6 +234,14 @@ def mae_vit_base_patch16_dec512d8b(**kwargs):
     return model
 
 
+def mae_vit_base_patch8_dec512d8b(**kwargs):
+    model = MaskedAutoencoderViT(
+        patch_size=8, embed_dim=768, depth=12, num_heads=12,
+        decoder_embed_dim=512, decoder_depth=8, decoder_num_heads=16,
+        mlp_ratio=4, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
+    return model
+
+
 def mae_vit_large_patch16_dec512d8b(**kwargs):
     model = MaskedAutoencoderViT(
         patch_size=16, embed_dim=1024, depth=24, num_heads=16,
@@ -246,5 +260,6 @@ def mae_vit_huge_patch14_dec512d8b(**kwargs):
 
 # set recommended archs
 mae_vit_base_patch16 = mae_vit_base_patch16_dec512d8b  # decoder: 512 dim, 8 blocks
+mae_vit_base_patch8 = mae_vit_base_patch8_dec512d8b  # decoder: 512 dim, 8 blocks
 mae_vit_large_patch16 = mae_vit_large_patch16_dec512d8b  # decoder: 512 dim, 8 blocks
 mae_vit_huge_patch14 = mae_vit_huge_patch14_dec512d8b  # decoder: 512 dim, 8 blocks

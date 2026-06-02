@@ -32,7 +32,8 @@ from util.misc import NativeScalerWithGradNormCount as NativeScaler
 
 import models_mae
 
-from engine_pretrain import train_one_epoch
+from engine_pretrain import train_one_epoch, evaluate_one_epoch
+from util.datasets import NiftiSliceDataset
 
 
 def get_args_parser():
@@ -44,10 +45,10 @@ def get_args_parser():
                         help='Accumulate gradient iterations (for increasing the effective batch size under memory constraints)')
 
     # Model parameters
-    parser.add_argument('--model', default='mae_vit_large_patch16', type=str, metavar='MODEL',
+    parser.add_argument('--model', default='mae_vit_base_patch16', type=str, metavar='MODEL',
                         help='Name of model to train')
 
-    parser.add_argument('--input_size', default=224, type=int,
+    parser.add_argument('--input_size', default=128, type=int,
                         help='images input size')
 
     parser.add_argument('--mask_ratio', default=0.75, type=float,
@@ -72,8 +73,30 @@ def get_args_parser():
                         help='epochs to warmup LR')
 
     # Dataset parameters
-    parser.add_argument('--data_path', default='/datasets01/imagenet_full_size/061417/', type=str,
+    parser.add_argument('--dataset', default='nifti', type=str, choices=['nifti', 'imagenet'],
+                        help='dataset type')
+    parser.add_argument('--data_path', default='/gpu-data3/nikos/datasets/ACDC_MnMs_all/heart_roi/images/', type=str,
                         help='dataset path')
+    parser.add_argument('--train_ratio', default=0.8, type=float,
+                        help='train/val split ratio for NIfTI volumes')
+    parser.add_argument('--split_seed', default=0, type=int,
+                        help='random seed for the NIfTI volume split')
+    parser.add_argument('--in_chans', default=1, type=int,
+                        help='number of input channels')
+    parser.add_argument('--rotation_deg', default=10.0, type=float,
+                        help='max rotation degrees for NIfTI training augmentation')
+    parser.add_argument('--volume_cache_size', default=0, type=int,
+                        help='number of NIfTI volumes to cache per worker (0 disables caching)')
+    parser.add_argument('--hflip', action='store_true',
+                        help='enable random horizontal flip for NIfTI training')
+    parser.add_argument('--no_hflip', action='store_false', dest='hflip',
+                        help='disable random horizontal flip for NIfTI training')
+    parser.set_defaults(hflip=True)
+    parser.add_argument('--zscore', action='store_true',
+                        help='enable per-slice z-score normalization for NIfTI data')
+    parser.add_argument('--no_zscore', action='store_false', dest='zscore',
+                        help='disable per-slice z-score normalization for NIfTI data')
+    parser.set_defaults(zscore=True)
 
     parser.add_argument('--output_dir', default='./output_dir',
                         help='path where to save, empty for no saving')
@@ -119,24 +142,65 @@ def main(args):
 
     cudnn.benchmark = True
 
-    # simple augmentation
-    transform_train = transforms.Compose([
+    if args.dataset == 'nifti':
+        dataset_train = NiftiSliceDataset(
+            data_dir=args.data_path,
+            is_train=True,
+            input_size=args.input_size,
+            train_ratio=args.train_ratio,
+            split_seed=args.split_seed,
+            zscore=args.zscore,
+            rotation_deg=args.rotation_deg,
+            hflip=args.hflip,
+            volume_cache_size=args.volume_cache_size,
+        )
+        dataset_val = NiftiSliceDataset(
+            data_dir=args.data_path,
+            is_train=False,
+            input_size=args.input_size,
+            train_ratio=args.train_ratio,
+            split_seed=args.split_seed,
+            zscore=args.zscore,
+            rotation_deg=0.0,
+            hflip=False,
+            volume_cache_size=args.volume_cache_size,
+        )
+        print(f"NIfTI train slices: {len(dataset_train)}, val slices: {len(dataset_val)}")
+    else:
+        if args.in_chans != 3:
+            print("Overriding in_chans to 3 for ImageNet training")
+            args.in_chans = 3
+
+        transform_train = transforms.Compose([
             transforms.RandomResizedCrop(args.input_size, scale=(0.2, 1.0), interpolation=3),  # 3 is bicubic
             transforms.RandomHorizontalFlip(),
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])])
-    dataset_train = datasets.ImageFolder(os.path.join(args.data_path, 'train'), transform=transform_train)
-    print(dataset_train)
+        transform_val = transforms.Compose([
+            transforms.Resize(int(args.input_size / (224 / 256)), interpolation=3),
+            transforms.CenterCrop(args.input_size),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])])
 
-    if True:  # args.distributed:
-        num_tasks = misc.get_world_size()
-        global_rank = misc.get_rank()
+        dataset_train = datasets.ImageFolder(os.path.join(args.data_path, 'train'), transform=transform_train)
+        dataset_val = datasets.ImageFolder(os.path.join(args.data_path, 'val'), transform=transform_val)
+        print(dataset_train)
+        print(dataset_val)
+
+    num_tasks = misc.get_world_size()
+    global_rank = misc.get_rank()
+    if args.distributed:
         sampler_train = torch.utils.data.DistributedSampler(
             dataset_train, num_replicas=num_tasks, rank=global_rank, shuffle=True
         )
+        sampler_val = torch.utils.data.DistributedSampler(
+            dataset_val, num_replicas=num_tasks, rank=global_rank, shuffle=False
+        )
         print("Sampler_train = %s" % str(sampler_train))
+        print("Sampler_val = %s" % str(sampler_val))
     else:
         sampler_train = torch.utils.data.RandomSampler(dataset_train)
+        sampler_val = torch.utils.data.SequentialSampler(dataset_val)
 
     if global_rank == 0 and args.log_dir is not None:
         os.makedirs(args.log_dir, exist_ok=True)
@@ -151,9 +215,20 @@ def main(args):
         pin_memory=args.pin_mem,
         drop_last=True,
     )
+    data_loader_val = torch.utils.data.DataLoader(
+        dataset_val, sampler=sampler_val,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        pin_memory=args.pin_mem,
+        drop_last=False,
+    )
     
     # define the model
-    model = models_mae.__dict__[args.model](norm_pix_loss=args.norm_pix_loss)
+    model = models_mae.__dict__[args.model](
+        norm_pix_loss=args.norm_pix_loss,
+        img_size=args.input_size,
+        in_chans=args.in_chans,
+    )
 
     model.to(device)
 
@@ -194,16 +269,24 @@ def main(args):
             log_writer=log_writer,
             args=args
         )
+
+        val_stats = evaluate_one_epoch(
+            model, data_loader_val,
+            device, epoch,
+            args=args
+        )
         if args.output_dir and (epoch % 20 == 0 or epoch + 1 == args.epochs):
             misc.save_model(
                 args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
                 loss_scaler=loss_scaler, epoch=epoch)
 
         log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
-                        'epoch': epoch,}
+                     **{f'val_{k}': v for k, v in val_stats.items()},
+                     'epoch': epoch,}
 
         if args.output_dir and misc.is_main_process():
             if log_writer is not None:
+                log_writer.add_scalar('val_loss', val_stats['loss'], epoch)
                 log_writer.flush()
             with open(os.path.join(args.output_dir, "log.txt"), mode="a", encoding="utf-8") as f:
                 f.write(json.dumps(log_stats) + "\n")

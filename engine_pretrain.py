@@ -80,3 +80,32 @@ def train_one_epoch(model: torch.nn.Module,
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+
+
+@torch.no_grad()
+def evaluate_one_epoch(model: torch.nn.Module,
+                       data_loader: Iterable,
+                       device: torch.device,
+                       epoch: int,
+                       args=None):
+    model.eval()
+    metric_logger = misc.MetricLogger(delimiter="  ")
+    header = 'Val: [{}]'.format(epoch)
+    print_freq = 20
+
+    for samples, _ in metric_logger.log_every(data_loader, print_freq, header):
+        samples = samples.to(device, non_blocking=True)
+
+        with torch.amp.autocast(device_type="cuda"):
+            loss, _, _ = model(samples, mask_ratio=args.mask_ratio)
+
+        loss_value = loss.item()
+        if not math.isfinite(loss_value):
+            print("Loss is {}, stopping validation".format(loss_value))
+            sys.exit(1)
+
+        metric_logger.update(loss=loss_value)
+
+    metric_logger.synchronize_between_processes()
+    print("Validation stats:", metric_logger)
+    return {k: meter.global_avg for k, meter in metric_logger.meters.items()}

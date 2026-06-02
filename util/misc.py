@@ -14,11 +14,11 @@ import datetime
 import os
 import time
 from collections import defaultdict, deque
+from math import inf
 from pathlib import Path
 
 import torch
 import torch.distributed as dist
-from torch._six import inf
 
 
 class SmoothedValue(object):
