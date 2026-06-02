@@ -1,6 +1,8 @@
 
+import argparse
 import re
 from typing import cast
+
 import nibabel as nib
 import numpy as np
 from pathlib import Path
@@ -36,14 +38,25 @@ def _resize_volume_slices(volume: np.ndarray, target_width: int, target_height: 
     return cast(np.ndarray, np.stack(resized_slices, axis=2))
 
 
-def extract_heart_roi_from_myocarditis_dataset(raw_data_dir, labels_dir, segmentation_dir, images_output_dir, labels_output_dir, width=None, height=None):
+def extract_heart_roi_from_myocarditis_dataset(
+    raw_data_dir,
+    segmentation_dir,
+    lesion_dir,
+    images_output_dir,
+    segmentation_output_dir,
+    lesion_output_dir,
+    width=None,
+    height=None,
+):
     raw_data_dir = Path(raw_data_dir)
-    labels_dir = Path(labels_dir)
     segmentation_dir = Path(segmentation_dir)
+    lesion_dir = Path(lesion_dir)
     images_output_dir = Path(images_output_dir)
-    labels_output_dir = Path(labels_output_dir)
+    segmentation_output_dir = Path(segmentation_output_dir)
+    lesion_output_dir = Path(lesion_output_dir)
     images_output_dir.mkdir(parents=True, exist_ok=True)
-    labels_output_dir.mkdir(parents=True, exist_ok=True)
+    segmentation_output_dir.mkdir(parents=True, exist_ok=True)
+    lesion_output_dir.mkdir(parents=True, exist_ok=True)
 
     should_resize_slices = False
     target_width = None
@@ -62,14 +75,17 @@ def extract_heart_roi_from_myocarditis_dataset(raw_data_dir, labels_dir, segment
         raise ValueError("Both width and height must be provided together for resizing.")
 
     # Get list of all raw data files
-    raw_data_files = list(raw_data_dir.glob("*.nii*"))
+    raw_data_files = sorted(raw_data_dir.glob("*.nii.gz"))
     total_files = len(raw_data_files)
     processed_count = 0
     missing_seg_count = 0
     failed_count = 0
-    label_saved_count = 0
-    label_missing_count = 0
-    label_failed_count = 0
+    segmentation_saved_count = 0
+    lesion_saved_count = 0
+    lesion_missing_count = 0
+    lesion_failed_count = 0
+    discarded_slice_count = 0
+    empty_volume_count = 0
 
     
     for raw_file in raw_data_files:
@@ -77,8 +93,6 @@ def extract_heart_roi_from_myocarditis_dataset(raw_data_dir, labels_dir, segment
         raw_name = raw_file.name
         if raw_name.endswith(".nii.gz"):
             raw_stem = raw_name[:-7]
-        elif raw_name.endswith(".nii"):
-            raw_stem = raw_name[:-4]
         else:
             print(f"Unsupported file extension for {raw_name}. Skipping.")
             continue
@@ -87,12 +101,8 @@ def extract_heart_roi_from_myocarditis_dataset(raw_data_dir, labels_dir, segment
         patient_id = re.sub(r"_\d{4}$", "", raw_stem)
 
         # Find corresponding segmentation file
-        seg_candidates = [
-            segmentation_dir / f"{patient_id}.nii.gz",
-            segmentation_dir / f"{patient_id}.nii",
-        ]
-        seg_file = next((p for p in seg_candidates if p.is_file()), None)
-        if seg_file is None:
+        seg_file = segmentation_dir / f"{patient_id}.nii.gz"
+        if not seg_file.is_file():
             print(f"Segmentation file not found for patient {patient_id}. Skipping.")
             missing_seg_count += 1
             continue
@@ -103,14 +113,18 @@ def extract_heart_roi_from_myocarditis_dataset(raw_data_dir, labels_dir, segment
             seg_img = nib.load(seg_file)
 
             raw_data = raw_img.get_fdata()
-            seg_data = seg_img.get_fdata()
+            seg_data = seg_img.get_fdata().round().astype("int16")
 
-            # Create a mask for the myocardium region (label 2 in segmentation)
-            roi_mask = seg_data == 2
+            # Create a mask for the heart 
+            roi_mask = seg_data > 0  # Assuming non-zero labels correspond to heart regions; adjust if needed for specific label values.
 
-            if roi_mask.ndim != 3 or raw_data.ndim < 3:
+            if roi_mask.ndim != 3 or raw_data.ndim != 3:
                 failed_count += 1
                 print(f"Image/segmentation is not 3D for patient {patient_id}. Skipping.")
+                continue
+            if raw_data.shape != seg_data.shape:
+                failed_count += 1
+                print(f"Image/segmentation shape mismatch for patient {patient_id}. Skipping.")
                 continue
 
             # Dilate the heart mask with a 3x3 structuring element.
@@ -137,17 +151,47 @@ def extract_heart_roi_from_myocarditis_dataset(raw_data_dir, labels_dir, segment
                 print(f"Bounding box exceeds image shape for patient {patient_id}. Skipping.")
                 continue
 
-            heart_roi = raw_data[crop_slices]
-            cropped_mask = dilated_heart_mask[crop_slices]
+            cropped_seg = seg_data[crop_slices]
+            keep_indices = []
+            discarded_indices = []
+            for z in range(cropped_seg.shape[2]):
+                label_slice = cropped_seg[:, :, z]
+                present_structures = 0
+                for label_value in (1, 2, 3):
+                    if np.count_nonzero(label_slice == label_value) > 50:
+                        present_structures += 1
+                if present_structures >= 2:
+                    keep_indices.append(z)
+                else:
+                    discarded_indices.append(z)
+
+            if discarded_indices:
+                discarded_slice_count += len(discarded_indices)
+                print(
+                    f"Discarded {len(discarded_indices)} slices for patient {patient_id} "
+                    f"(need >=2 structures with >50 pixels): {discarded_indices}"
+                )
+            if not keep_indices:
+                empty_volume_count += 1
+                print(
+                    f"No slices meet keep criteria (>=2 structures with >50 pixels) for patient {patient_id}. "
+                    "Skipping."
+                )
+                continue
+
+            heart_roi = raw_data[crop_slices][:, :, keep_indices]
+            cropped_mask = dilated_heart_mask[crop_slices][:, :, keep_indices]
             heart_roi = np.where(cropped_mask, heart_roi, 0)
 
             if should_resize_slices:
                 assert target_width is not None and target_height is not None
-                heart_roi = _resize_volume_slices(heart_roi, target_width=target_width, target_height=target_height, order=1)
+                heart_roi = _resize_volume_slices(
+                    heart_roi, target_width=target_width, target_height=target_height, order=1
+                )
 
             # Save the extracted heart ROI as a new NIfTI file
             roi_img = nib.Nifti1Image(heart_roi, affine=raw_img.affine, header=raw_img.header)
-            output_path = images_output_dir / f"{patient_id}_0000.nii.gz"
+            output_path = images_output_dir / raw_file.name
             nib.save(roi_img, output_path)
             processed_count += 1
             print(
@@ -155,44 +199,61 @@ def extract_heart_roi_from_myocarditis_dataset(raw_data_dir, labels_dir, segment
                 f"with bbox min={tuple(bbox_min.tolist())}, max={tuple((bbox_max - 1).tolist())}"
             )
 
-            # Find and process the associated label file with the same bounding-box crop.
-            label_file = labels_dir.joinpath(f"{patient_id}.nii.gz")
+            # Crop and save the original segmentation labels with the same bounding box.
+            seg_data = cropped_seg[:, :, keep_indices]
+            if should_resize_slices:
+                assert target_width is not None and target_height is not None
+                seg_data = _resize_volume_slices(
+                    seg_data, target_width=target_width, target_height=target_height, order=0
+                ).astype("int16")
 
-            if not label_file.is_file():
-                label_missing_count += 1
-                print(f"Associated label file not found for patient {patient_id}.")
+            seg_output_path = segmentation_output_dir / seg_file.name
+            trimmed_seg_img = nib.Nifti1Image(seg_data, affine=seg_img.affine, header=seg_img.header)
+            nib.save(trimmed_seg_img, seg_output_path)
+            segmentation_saved_count += 1
+            print(
+                f"Saved trimmed segmentation for patient {patient_id} to {seg_output_path} "
+                f"(original shape: {seg_img.shape}, trimmed shape: {seg_data.shape})"
+            )
+
+            # Find and process the associated lesion mask with the same bounding-box crop.
+            lesion_file = lesion_dir / f"{patient_id}.nii.gz"
+            if not lesion_file.is_file():
+                lesion_missing_count += 1
+                print(f"Associated lesion file not found for patient {patient_id}.")
                 continue
 
             try:
-                label_img = nib.load(label_file)
-                # Cast labels to integer segmentation dtype to avoid float truncation warnings on load.
-                label_data = label_img.get_fdata().round().astype("int16")
+                lesion_img = nib.load(lesion_file)
+                lesion_data = lesion_img.get_fdata().round().astype("int16")
 
-                if label_data.ndim < 3:
-                    label_failed_count += 1
-                    print(f"Label for patient {patient_id} is not 3D, cannot apply bbox cropping.")
+                if lesion_data.ndim != 3:
+                    lesion_failed_count += 1
+                    print(f"Lesion mask for patient {patient_id} is not 3D, cannot apply bbox cropping.")
                     continue
-                if any(label_data.shape[dim] < int(bbox_max[dim]) for dim in range(3)):
-                    label_failed_count += 1
-                    print(f"Label/image bounding-box mismatch for patient {patient_id}.")
+                if lesion_data.shape != raw_data.shape:
+                    lesion_failed_count += 1
+                    print(f"Lesion/image shape mismatch for patient {patient_id}.")
                     continue
 
-                label_data = label_data[crop_slices]
+                lesion_data = lesion_data[crop_slices][:, :, keep_indices]
                 if should_resize_slices:
                     assert target_width is not None and target_height is not None
-                    label_data = _resize_volume_slices(
-                        label_data, target_width=target_width, target_height=target_height, order=0
-                    )
-                    label_data = label_data.astype("int16")
+                    lesion_data = _resize_volume_slices(
+                        lesion_data, target_width=target_width, target_height=target_height, order=0
+                    ).astype("int16")
 
-                label_output_path = labels_output_dir / f"{patient_id}.nii.gz"
-                trimmed_label_img = nib.Nifti1Image(label_data, affine=label_img.affine, header=label_img.header)
-                nib.save(trimmed_label_img, label_output_path)
-                label_saved_count += 1
-                print(f"Saved trimmed label for patient {patient_id} to {label_output_path} (original shape: {label_img.shape}, trimmed shape: {label_data.shape})")
-            except Exception as label_exc:
-                label_failed_count += 1
-                print(f"Failed processing label for patient {patient_id}: {label_exc}")
+                lesion_output_path = lesion_output_dir / lesion_file.name
+                trimmed_lesion_img = nib.Nifti1Image(lesion_data, affine=lesion_img.affine, header=lesion_img.header)
+                nib.save(trimmed_lesion_img, lesion_output_path)
+                lesion_saved_count += 1
+                print(
+                    f"Saved trimmed lesion for patient {patient_id} to {lesion_output_path} "
+                    f"(original shape: {lesion_img.shape}, trimmed shape: {lesion_data.shape})"
+                )
+            except Exception as lesion_exc:
+                lesion_failed_count += 1
+                print(f"Failed processing lesion for patient {patient_id}: {lesion_exc}")
         except Exception as exc:
             failed_count += 1
             print(f"Failed processing patient {patient_id}: {exc}")
@@ -201,21 +262,65 @@ def extract_heart_roi_from_myocarditis_dataset(raw_data_dir, labels_dir, segment
         "Summary: "
         f"total={total_files}, processed={processed_count}, "
         f"missing_seg={missing_seg_count}, failed={failed_count}, "
-        f"labels_saved={label_saved_count}, labels_missing={label_missing_count}, labels_failed={label_failed_count}"
+        f"segmentations_saved={segmentation_saved_count}, lesions_saved={lesion_saved_count}, "
+        f"lesions_missing={lesion_missing_count}, lesions_failed={lesion_failed_count}, "
+        f"discarded_slices={discarded_slice_count}, empty_volumes={empty_volume_count}"
     )
-    
+
+
+def _build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Crop CMR volumes around heart ROI and resize slices (optional)."
+    )
+    parser.add_argument(
+        "--input_images_dir",
+        default="/gpu-data3/nikos/datasets/cmr/original/control/",
+        help="Directory with input image volumes (.nii.gz).",
+    )
+    parser.add_argument(
+        "--input_segmentation_dir",
+        default="/gpu-data3/nikos/nnUnet_experiments/nnUNet_results/Dataset141_ACDC+MNMs/predict-cmr/postprocessed/",
+        help="Directory with heart segmentation masks (.nii.gz).",
+    )
+    parser.add_argument(
+        "--input_lesion_dir",
+        default="/gpu-data3/nikos/datasets/cmr/original/labels/",
+        help="Directory with lesion masks (.nii.gz).",
+    )
+    parser.add_argument(
+        "--output_images_dir",
+        default="/gpu-data3/nikos/datasets/cmr/heart_roi/control/",
+        help="Directory to write cropped image volumes.",
+    )
+    parser.add_argument(
+        "--output_segmentation_dir",
+        default="/gpu-data3/nikos/datasets/cmr/heart_roi/segmentation/",
+        help="Directory to write cropped heart segmentation masks.",
+    )
+    parser.add_argument(
+        "--output_lesion_dir",
+        default="/gpu-data3/nikos/datasets/cmr/heart_roi/labels/",
+        help="Directory to write cropped lesion masks.",
+    )
+    parser.add_argument("--width", type=int, default=None, help="Target slice width (optional).")
+    parser.add_argument("--height", type=int, default=None, help="Target slice height (optional).")
+    return parser
+
+
+def main() -> None:
+    parser = _build_arg_parser()
+    args = parser.parse_args()
+    extract_heart_roi_from_myocarditis_dataset(
+        raw_data_dir=args.input_images_dir,
+        segmentation_dir=args.input_segmentation_dir,
+        lesion_dir=args.input_lesion_dir,
+        images_output_dir=args.output_images_dir,
+        segmentation_output_dir=args.output_segmentation_dir,
+        lesion_output_dir=args.output_lesion_dir,
+        width=args.width,
+        height=args.height,
+    )
+
 
 if __name__ == "__main__":
-    raw_data_dir="/gpu-data3/nikos/datasets/cardiac_mri_ae/original/all/"
-    labels_dir="/gpu-data3/nikos/datasets/cardiac_mri_ae/original/gt/"
-    segmentation_dir="/gpu-data3/nikos/nnUnet_experiments/nnUNet_results/Dataset141_ACDC+MNMs/predict/postprocessed/"
-    images_output_dir="/gpu-data3/nikos/datasets/cardiac_mri_ae/myocardium/all/"
-    labels_output_dir="/gpu-data3/nikos/datasets/cardiac_mri_ae/myocardium/gt/"
-    
-    extract_heart_roi_from_myocarditis_dataset(raw_data_dir=raw_data_dir,
-                                               labels_dir=labels_dir,
-                                               segmentation_dir=segmentation_dir,
-                                               images_output_dir=images_output_dir,
-                                               labels_output_dir=labels_output_dir,
-                                               width=128,
-                                               height=128)
+    main()
