@@ -17,6 +17,7 @@ import PIL
 import nibabel as nib
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torchvision.transforms import functional as TF
 from torchvision.transforms.functional import InterpolationMode
 
@@ -38,16 +39,37 @@ class NiftiSliceDataset(torch.utils.data.Dataset):
         rotation_deg=0.0,
         hflip=False,
         volume_cache_size=0,
+        translate_frac=0.0,
+        scale_range=(1.0, 1.0),
+        elastic_alpha=0.0,
+        elastic_sigma=0.0,
+        elastic_prob=0.0,
+        split_id = -1
     ):
         self.data_dir = Path(data_dir)
         self.is_train = is_train
         self.input_size = int(input_size)
         self.train_ratio = float(train_ratio)
-        self.split_seed = int(split_seed)
+        self.split_seed = int(split_seed) # Active only when split_id is -1 for random split; ignored otherwise
+        self.split_id = int(split_id)
+        if self.split_id <= -1 or self.split_id > 4:
+            raise ValueError("split_id must be between 0 and 4 (inclusive) or -1 for random split")
         self.zscore = bool(zscore)
         self.rotation_deg = float(rotation_deg)
         self.hflip = bool(hflip)
         self.volume_cache_size = int(volume_cache_size)
+        self.translate_frac = float(translate_frac)
+        if isinstance(scale_range, (list, tuple)) and len(scale_range) == 2:
+            self.scale_range = (float(scale_range[0]), float(scale_range[1]))
+        else:
+            raise ValueError("scale_range must be a 2-element list/tuple")
+        if self.scale_range[0] <= 0 or self.scale_range[1] <= 0:
+            raise ValueError("scale_range values must be > 0")
+        if self.scale_range[0] > self.scale_range[1]:
+            raise ValueError("scale_range min must be <= max")
+        self.elastic_alpha = float(elastic_alpha)
+        self.elastic_sigma = float(elastic_sigma)
+        self.elastic_prob = float(elastic_prob)
 
         if not self.data_dir.exists():
             raise FileNotFoundError(f"NIfTI directory not found: {self.data_dir}")
@@ -57,16 +79,25 @@ class NiftiSliceDataset(torch.utils.data.Dataset):
         if not volume_paths:
             raise FileNotFoundError(f"No NIfTI files found under: {self.data_dir}")
 
-        rng = random.Random(self.split_seed)
-        rng.shuffle(volume_paths)
-        split_index = int(len(volume_paths) * self.train_ratio)
-        if split_index == 0 or split_index == len(volume_paths):
-            raise ValueError("Train/val split would be empty; adjust train_ratio or dataset size.")
+        if self.split_id == -1: # Random split based on seed
+            rng = random.Random(self.split_seed)
+            rng.shuffle(volume_paths)
+            split_index = int(len(volume_paths) * self.train_ratio)
+            if split_index == 0 or split_index == len(volume_paths):
+                raise ValueError("Train/val split would be empty; adjust train_ratio or dataset size.")
 
-        if self.is_train:
-            self.volume_paths = volume_paths[:split_index]
-        else:
-            self.volume_paths = volume_paths[split_index:]
+            if self.is_train:
+                self.volume_paths = volume_paths[:split_index]
+            else:
+                self.volume_paths = volume_paths[split_index:]
+        else: # Predefined split into 5 folds. split_id determines which fold is used for validation (0-4), the rest for training
+            split_size = len(volume_paths) // 5
+            
+            if self.is_train:
+                self.volume_paths = volume_paths[:self.split_id*split_size] + volume_paths[(self.split_id+1)*split_size:]
+            else:
+                self.volume_paths = volume_paths[self.split_id*split_size:(self.split_id+1)*split_size]
+                
 
         self.slice_mappings = []
         for volume_path in self.volume_paths:
@@ -76,6 +107,7 @@ class NiftiSliceDataset(torch.utils.data.Dataset):
                 self.slice_mappings.append((volume_path, slice_idx))
 
         self._volume_cache = OrderedDict()
+        self._elastic_kernel_cache = {}
 
     def _get_volume_shape(self, volume_path):
         img = nib.load(str(volume_path))
@@ -100,6 +132,70 @@ class NiftiSliceDataset(torch.utils.data.Dataset):
         if len(self._volume_cache) > self.volume_cache_size:
             self._volume_cache.popitem(last=False)
         return img
+
+    def _get_gaussian_kernel(self, sigma, device, dtype):
+        if sigma <= 0:
+            return None
+        key = (float(sigma), device, dtype)
+        cached = self._elastic_kernel_cache.get(key)
+        if cached is not None:
+            return cached
+        radius = max(1, int(round(3 * sigma)))
+        kernel_size = radius * 2 + 1
+        coords = torch.arange(kernel_size, device=device, dtype=dtype) - radius
+        kernel_1d = torch.exp(-(coords ** 2) / (2 * sigma * sigma))
+        kernel_1d = kernel_1d / kernel_1d.sum()
+        kernel_2d = torch.outer(kernel_1d, kernel_1d)
+        kernel_2d = kernel_2d / kernel_2d.sum()
+        kernel = kernel_2d.view(1, 1, kernel_size, kernel_size)
+        self._elastic_kernel_cache[key] = kernel
+        return kernel
+
+    def _elastic_deform(self, slice_tensor):
+        if self.elastic_alpha <= 0 or self.elastic_sigma <= 0 or self.elastic_prob <= 0:
+            return slice_tensor
+        if random.random() >= self.elastic_prob:
+            return slice_tensor
+
+        device = slice_tensor.device
+        dtype = slice_tensor.dtype
+        _, height, width = slice_tensor.shape
+        dx = torch.rand(1, 1, height, width, device=device, dtype=dtype) * 2 - 1
+        dy = torch.rand(1, 1, height, width, device=device, dtype=dtype) * 2 - 1
+        kernel = self._get_gaussian_kernel(self.elastic_sigma, device, dtype)
+        if kernel is not None:
+            padding = kernel.shape[-1] // 2
+            dx = F.conv2d(dx, kernel, padding=padding)
+            dy = F.conv2d(dy, kernel, padding=padding)
+        dx = dx * self.elastic_alpha
+        dy = dy * self.elastic_alpha
+
+        grid_y, grid_x = torch.meshgrid(
+            torch.arange(height, device=device, dtype=dtype),
+            torch.arange(width, device=device, dtype=dtype),
+            indexing='ij',
+        )
+        grid_x = grid_x + dx[0, 0]
+        grid_y = grid_y + dy[0, 0]
+
+        if width > 1:
+            grid_x = 2.0 * grid_x / (width - 1) - 1.0
+        else:
+            grid_x = torch.zeros_like(grid_x)
+        if height > 1:
+            grid_y = 2.0 * grid_y / (height - 1) - 1.0
+        else:
+            grid_y = torch.zeros_like(grid_y)
+
+        grid = torch.stack((grid_x, grid_y), dim=-1).unsqueeze(0)
+        warped = F.grid_sample(
+            slice_tensor.unsqueeze(0),
+            grid,
+            mode='bilinear',
+            padding_mode='zeros',
+            align_corners=True,
+        )
+        return warped.squeeze(0)
 
     def __len__(self):
         return len(self.slice_mappings)
@@ -132,14 +228,34 @@ class NiftiSliceDataset(torch.utils.data.Dataset):
         if self.is_train:
             if self.hflip and random.random() < 0.5:
                 slice_tensor = TF.hflip(slice_tensor)
-            if self.rotation_deg > 0:
-                angle = random.uniform(-self.rotation_deg, self.rotation_deg)
-                slice_tensor = TF.rotate(
+            apply_affine = (
+                self.rotation_deg > 0
+                or self.translate_frac > 0
+                or self.scale_range != (1.0, 1.0)
+            )
+            if apply_affine:
+                angle = random.uniform(-self.rotation_deg, self.rotation_deg) if self.rotation_deg > 0 else 0.0
+                max_translate = self.translate_frac * self.input_size
+                if max_translate > 0:
+                    translate_x = random.uniform(-max_translate, max_translate)
+                    translate_y = random.uniform(-max_translate, max_translate)
+                else:
+                    translate_x = 0.0
+                    translate_y = 0.0
+                if self.scale_range != (1.0, 1.0):
+                    scale = random.uniform(self.scale_range[0], self.scale_range[1])
+                else:
+                    scale = 1.0
+                slice_tensor = TF.affine(
                     slice_tensor,
                     angle=angle,
+                    translate=[translate_x, translate_y],
+                    scale=scale,
+                    shear=[0.0, 0.0],
                     interpolation=InterpolationMode.BILINEAR,
                     fill=0.0,
                 )
+            slice_tensor = self._elastic_deform(slice_tensor)
 
         return slice_tensor, 0
 

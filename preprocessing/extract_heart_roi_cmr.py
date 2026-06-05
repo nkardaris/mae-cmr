@@ -113,6 +113,7 @@ def extract_heart_roi_from_myocarditis_dataset(
             seg_img = nib.load(seg_file)
 
             raw_data = raw_img.get_fdata()
+            raw_data = raw_data - raw_data.min()  # Shift to non-negative if needed
             seg_data = seg_img.get_fdata().round().astype("int16")
 
             # Create a mask for the heart 
