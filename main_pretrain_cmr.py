@@ -38,7 +38,7 @@ from util.datasets import NiftiSliceDataset
 
 def get_args_parser():
     parser = argparse.ArgumentParser('MAE CMR pre-training', add_help=False)
-    parser.add_argument('--batch_size', default=64, type=int,
+    parser.add_argument('--batch_size', default=32, type=int,
                         help='Batch size per GPU (effective batch size is batch_size * accum_iter * # gpus')
     parser.add_argument('--epochs', default=400, type=int)
     parser.add_argument('--accum_iter', default=1, type=int,
@@ -85,6 +85,12 @@ def get_args_parser():
                         help='random seed for the NIfTI volume split (active only if split_id is -1)')
     parser.add_argument('--in_chans', default=1, type=int,
                         help='number of input channels')
+    parser.add_argument('--seg_dir', default=None, type=str,
+                        help='directory with paired segmentation masks; enables structural '
+                             '(myocardium-only) masking instead of random masking')
+    parser.add_argument('--patch_size', default=16, type=int,
+                        help='patch size used to build the per-patch myocardium indicator '
+                             '(must match the model patch size)')
     parser.add_argument('--rotation_deg', default=10.0, type=float,
                         help='max rotation degrees for NIfTI training augmentation')
     parser.add_argument('--translate_frac', default=0.05, type=float,
@@ -122,8 +128,11 @@ def get_args_parser():
     parser.add_argument('--device', default='cuda',
                         help='device to use for training / testing')
     parser.add_argument('--seed', default=0, type=int)
-    parser.add_argument('--resume', default='/gpu-data3/nikos/code/mae-cmr/output_dir/checkpoint-399.pth',
-                        help='resume from checkpoint')
+    parser.add_argument('--resume', default='',
+                        help='resume from checkpoint (continues optimizer state and epoch)')
+    parser.add_argument('--init_from', default=None, type=str,
+                        help='initialize model weights only from this checkpoint (fresh optimizer/'
+                             'schedule); use for stage B (LGE) after stage A (cine) pre-training')
 
     parser.add_argument('--start_epoch', default=0, type=int, metavar='N',
                         help='start epoch')
@@ -175,13 +184,16 @@ def main(args):
 
     cudnn.benchmark = True
 
+    # structural (myocardium-only) masking is enabled when a segmentation dir is given
+    args.structural_masking = args.seg_dir is not None
+
     if args.dataset == 'nifti':
         dataset_train = NiftiSliceDataset(
             data_dir=args.data_path,
             is_train=True,
             input_size=args.input_size,
             train_ratio=args.train_ratio,
-            split_id=args.split_id,            
+            split_id=args.split_id,
             split_seed=args.split_seed,
             zscore=args.zscore,
             rotation_deg=args.rotation_deg,
@@ -192,13 +204,15 @@ def main(args):
             elastic_alpha=args.elastic_alpha,
             elastic_sigma=args.elastic_sigma,
             elastic_prob=args.elastic_prob,
+            seg_dir=args.seg_dir,
+            patch_size=args.patch_size,
         )
         dataset_val = NiftiSliceDataset(
             data_dir=args.data_path,
             is_train=False,
             input_size=args.input_size,
             train_ratio=args.train_ratio,
-            split_id=args.split_id,            
+            split_id=args.split_id,
             split_seed=args.split_seed,
             zscore=args.zscore,
             rotation_deg=0.0,
@@ -209,8 +223,11 @@ def main(args):
             elastic_alpha=0.0,
             elastic_sigma=0.0,
             elastic_prob=0.0,
+            seg_dir=args.seg_dir,
+            patch_size=args.patch_size,
         )
         print(f"NIfTI train slices: {len(dataset_train)}, val slices: {len(dataset_val)}")
+        print(f"Structural (myocardium) masking: {args.structural_masking}")
     else:
         if args.in_chans != 3:
             print("Overriding in_chans to 3 for ImageNet training")
@@ -314,6 +331,13 @@ def main(args):
     print(optimizer)
     loss_scaler = NativeScaler()
 
+    # Stage B (LGE) init: load weights only from the stage-A (cine) checkpoint, keeping a
+    # fresh optimizer and LR schedule (unlike --resume, which continues epoch/optimizer state).
+    if args.init_from:
+        checkpoint = torch.load(args.init_from, map_location='cpu')
+        msg = model_without_ddp.load_state_dict(checkpoint['model'], strict=False)
+        print(f"Initialized weights from {args.init_from}: {msg}")
+
     misc.load_model(args=args, model_without_ddp=model_without_ddp, optimizer=optimizer, loss_scaler=loss_scaler)
 
     best_val_loss = float('inf')
@@ -381,8 +405,8 @@ if __name__ == '__main__':
     args = get_args_parser()
     args = args.parse_args()
     if args.output_dir:
-        args.output_dir = Path(args.output_dir).joinpath(f"split_{args.split_id}" if args.split_id >= 0 else "split_random_seed_{args.split_seed}")
+        args.output_dir = Path(args.output_dir).joinpath(f"split_{args.split_id}" if args.split_id >= 0 else f"split_random_seed_{args.split_seed}")
         Path(args.output_dir).mkdir(parents=True, exist_ok=True)
-        args.log_dir = Path(args.log_dir).joinpath(f"split_{args.split_id}" if args.split_id >= 0 else "split_random_seed_{args.split_seed}")
+        args.log_dir = Path(args.log_dir).joinpath(f"split_{args.split_id}" if args.split_id >= 0 else f"split_random_seed_{args.split_seed}")
         Path(args.log_dir).mkdir(parents=True, exist_ok=True)
     main(args)

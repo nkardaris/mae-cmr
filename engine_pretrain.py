@@ -36,16 +36,17 @@ def train_one_epoch(model: torch.nn.Module,
     if log_writer is not None:
         print('log_dir: {}'.format(log_writer.log_dir))
 
-    for data_iter_step, (samples, _) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
+    for data_iter_step, (samples, targets) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
 
         # we use a per iteration (instead of per epoch) lr scheduler
         if data_iter_step % accum_iter == 0:
             lr_sched.adjust_learning_rate(optimizer, data_iter_step / len(data_loader) + epoch, args)
 
         samples = samples.to(device, non_blocking=True)
+        patch_myo_mask = targets.to(device, non_blocking=True) if getattr(args, 'structural_masking', False) else None
 
         with torch.cuda.amp.autocast():
-            loss, _, _ = model(samples, mask_ratio=args.mask_ratio)
+            loss, _, _ = model(samples, mask_ratio=args.mask_ratio, patch_myo_mask=patch_myo_mask)
 
         loss_value = loss.item()
 
@@ -93,11 +94,12 @@ def evaluate_one_epoch(model: torch.nn.Module,
     header = 'Val: [{}]'.format(epoch)
     print_freq = 20
 
-    for samples, _ in metric_logger.log_every(data_loader, print_freq, header):
+    for samples, targets in metric_logger.log_every(data_loader, print_freq, header):
         samples = samples.to(device, non_blocking=True)
+        patch_myo_mask = targets.to(device, non_blocking=True) if getattr(args, 'structural_masking', False) else None
 
         with torch.amp.autocast(device_type="cuda"):
-            loss, _, _ = model(samples, mask_ratio=args.mask_ratio)
+            loss, _, _ = model(samples, mask_ratio=args.mask_ratio, patch_myo_mask=patch_myo_mask)
 
         loss_value = loss.item()
         if not math.isfinite(loss_value):

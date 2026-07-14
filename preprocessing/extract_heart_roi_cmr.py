@@ -38,6 +38,20 @@ def _resize_volume_slices(volume: np.ndarray, target_width: int, target_height: 
     return cast(np.ndarray, np.stack(resized_slices, axis=2))
 
 
+def _znorm_volume_roi(volume: np.ndarray, roi_mask: np.ndarray) -> np.ndarray:
+    """Z-score the whole volume using the mean/std of the heart-ROI voxels only.
+
+    The heart ROI is anatomically consistent across patients, unlike the bounding-box
+    crop (whose lung/chest-wall content varies), so its statistics make intensities
+    comparable between patients and cohorts.
+    """
+    roi_voxels = volume[roi_mask]
+    std = float(roi_voxels.std())
+    if std < 1e-6:
+        std = 1.0
+    return (volume.astype(np.float32) - float(roi_voxels.mean())) / std
+
+
 def extract_heart_roi_from_myocarditis_dataset(
     raw_data_dir,
     segmentation_dir,
@@ -47,6 +61,8 @@ def extract_heart_roi_from_myocarditis_dataset(
     lesion_output_dir,
     width=None,
     height=None,
+    znorm=False,
+    zero_background=False,
 ):
     raw_data_dir = Path(raw_data_dir)
     segmentation_dir = Path(segmentation_dir)
@@ -113,7 +129,6 @@ def extract_heart_roi_from_myocarditis_dataset(
             seg_img = nib.load(seg_file)
 
             raw_data = raw_img.get_fdata()
-            raw_data = raw_data - raw_data.min()  # Shift to non-negative if needed
             seg_data = seg_img.get_fdata().round().astype("int16")
 
             # Create a mask for the heart 
@@ -181,8 +196,15 @@ def extract_heart_roi_from_myocarditis_dataset(
                 continue
 
             heart_roi = raw_data[crop_slices][:, :, keep_indices]
-            cropped_mask = dilated_heart_mask[crop_slices][:, :, keep_indices]
-            heart_roi = np.where(cropped_mask, heart_roi, 0)
+
+            if znorm:
+                heart_roi = _znorm_volume_roi(heart_roi, cropped_seg[:, :, keep_indices] > 0)
+
+            if zero_background:
+                # Fill with the minimum rather than a literal 0: after z-scoring, 0 is the
+                # tissue mean, so a 0 background would sit inside the myocardium distribution.
+                cropped_mask = dilated_heart_mask[crop_slices][:, :, keep_indices]
+                heart_roi = np.where(cropped_mask, heart_roi, heart_roi.min())
 
             if should_resize_slices:
                 assert target_width is not None and target_height is not None
@@ -290,21 +312,31 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--output_images_dir",
-        default="/gpu-data3/nikos/datasets/cmr/heart_roi/control/",
+        default="/gpu-data3/nikos/datasets/cmr/heart_roi_raw/control/",
         help="Directory to write cropped image volumes.",
     )
     parser.add_argument(
         "--output_segmentation_dir",
-        default="/gpu-data3/nikos/datasets/cmr/heart_roi/segmentation/",
+        default="/gpu-data3/nikos/datasets/cmr/heart_roi_raw/segmentation/",
         help="Directory to write cropped heart segmentation masks.",
     )
     parser.add_argument(
         "--output_lesion_dir",
-        default="/gpu-data3/nikos/datasets/cmr/heart_roi/labels/",
+        default="/gpu-data3/nikos/datasets/cmr/heart_roi_raw/labels/",
         help="Directory to write cropped lesion masks.",
     )
     parser.add_argument("--width", type=int, default=None, help="Target slice width (optional).")
     parser.add_argument("--height", type=int, default=None, help="Target slice height (optional).")
+    parser.add_argument(
+        "--znorm",
+        action="store_true",
+        help="Z-score the cropped image volumes using heart-ROI (seg > 0) mean/std.",
+    )
+    parser.add_argument(
+        "--zero_background",
+        action="store_true",
+        help="Zero out the voxels outside the dilated heart mask.",
+    )
     return parser
 
 
@@ -320,6 +352,8 @@ def main() -> None:
         lesion_output_dir=args.output_lesion_dir,
         width=args.width,
         height=args.height,
+        znorm=args.znorm,
+        zero_background=args.zero_background,
     )
 
 

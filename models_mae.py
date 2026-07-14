@@ -153,7 +153,81 @@ class MaskedAutoencoderViT(nn.Module):
 
         return x_masked, mask, ids_restore
 
-    def forward_encoder(self, x, mask_ratio):
+    def structural_masking(self, x, patch_myo_mask, mask_ratio):
+        """Mask the L*mask_ratio patches, biased toward myocardium patches.
+
+        Same fixed-keep machinery as ``random_masking`` (so batch shapes are
+        constant), but myocardium patches are sorted to the "remove" end. With
+        mask_ratio*L <= (#myocardium patches), the removed set is a random subset
+        of myocardium and the remaining myocardium stays visible as context; the
+        overflow (if any) spills onto random non-myocardium patches.
+        patch_myo_mask: [N, L], 1.0 = patch contains myocardium.
+        """
+        N, L, D = x.shape
+        len_keep = int(L * (1 - mask_ratio))
+
+        # myocardium patches get noise in [1, 2), others in [0, 1) -> myo removed first
+        noise = torch.rand(N, L, device=x.device) + patch_myo_mask.to(x.dtype)
+
+        ids_shuffle = torch.argsort(noise, dim=1)  # ascend: small is keep, large is remove
+        ids_restore = torch.argsort(ids_shuffle, dim=1)
+
+        ids_keep = ids_shuffle[:, :len_keep]
+        x_masked = torch.gather(x, dim=1, index=ids_keep.unsqueeze(-1).repeat(1, 1, D))
+
+        mask = torch.ones([N, L], device=x.device)
+        mask[:, :len_keep] = 0
+        mask = torch.gather(mask, dim=1, index=ids_restore)
+
+        return x_masked, mask, ids_restore
+
+    @torch.no_grad()
+    def reconstruct_explicit(self, imgs, remove_mask):
+        """Inference: reconstruct masking exactly the patches flagged in remove_mask.
+
+        Unlike random/structural masking, the masked set is given explicitly, which
+        lets the anomaly scorer hold out chosen myocardium patches and read their
+        per-patch reconstruction error. All samples in the batch must remove the
+        same number of patches (use batch size 1 for per-slice variable counts).
+        remove_mask: [N, L], 1 = masked/held-out. Returns (pred [N, L, p*p*c],
+        mask [N, L], per_patch_err [N, L]).
+        """
+        x = self.patch_embed(imgs)
+        x = x + self.pos_embed[:, 1:, :]
+        N, L, D = x.shape
+
+        remove = remove_mask.to(x.dtype)
+        # stable argsort puts kept patches (0) first in their original order, removed last
+        ids_shuffle = torch.argsort(remove, dim=1, stable=True)
+        ids_restore = torch.argsort(ids_shuffle, dim=1)
+        len_keep = int(L - int(remove[0].sum().item()))
+
+        ids_keep = ids_shuffle[:, :len_keep]
+        x_kept = torch.gather(x, dim=1, index=ids_keep.unsqueeze(-1).repeat(1, 1, D))
+
+        cls_token = self.cls_token + self.pos_embed[:, :1, :]
+        cls_tokens = cls_token.expand(x_kept.shape[0], -1, -1)
+        x_kept = torch.cat((cls_tokens, x_kept), dim=1)
+        for blk in self.blocks:
+            x_kept = blk(x_kept)
+        x_kept = self.norm(x_kept)
+
+        pred = self.forward_decoder(x_kept, ids_restore)
+
+        mask = torch.ones([N, L], device=imgs.device)
+        mask[:, :len_keep] = 0
+        mask = torch.gather(mask, dim=1, index=ids_restore)
+
+        target = self.patchify(imgs)
+        if self.norm_pix_loss:
+            mean = target.mean(dim=-1, keepdim=True)
+            var = target.var(dim=-1, keepdim=True)
+            target = (target - mean) / (var + 1.e-6) ** .5
+        per_patch_err = ((pred - target) ** 2).mean(dim=-1)  # [N, L]
+
+        return pred, mask, per_patch_err
+
+    def forward_encoder(self, x, mask_ratio, patch_myo_mask=None):
         # embed patches
         x = self.patch_embed(x)
 
@@ -161,7 +235,10 @@ class MaskedAutoencoderViT(nn.Module):
         x = x + self.pos_embed[:, 1:, :]
 
         # masking: length -> length * mask_ratio
-        x, mask, ids_restore = self.random_masking(x, mask_ratio)
+        if patch_myo_mask is not None:
+            x, mask, ids_restore = self.structural_masking(x, patch_myo_mask, mask_ratio)
+        else:
+            x, mask, ids_restore = self.random_masking(x, mask_ratio)
 
         # append cls token
         cls_token = self.cls_token + self.pos_embed[:, :1, :]
@@ -219,8 +296,8 @@ class MaskedAutoencoderViT(nn.Module):
         loss = (loss * mask).sum() / mask.sum()  # mean loss on removed patches
         return loss
 
-    def forward(self, imgs, mask_ratio=0.75):
-        latent, mask, ids_restore = self.forward_encoder(imgs, mask_ratio)
+    def forward(self, imgs, mask_ratio=0.75, patch_myo_mask=None):
+        latent, mask, ids_restore = self.forward_encoder(imgs, mask_ratio, patch_myo_mask)
         pred = self.forward_decoder(latent, ids_restore)  # [N, L, p*p*3]
         loss = self.forward_loss(imgs, pred, mask)
         return loss, pred, mask

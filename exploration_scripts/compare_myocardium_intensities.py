@@ -1,3 +1,18 @@
+"""Compare myocardium LGE intensities between the control and myocarditis cohorts.
+
+For every volume with an nnUNet heart segmentation, the whole volume is z-normalized
+using the heart-ROI (seg > 0) mean/std, which makes patients from the two cohorts
+(different scanners/acquisitions) comparable. Three views are then plotted as
+overlaid control-vs-myocarditis histograms and saved as a single figure:
+
+  1. Myocardium / LV blood-pool ratio, per voxel (patients without a blood pool are skipped).
+  2. Per-patient z-score of the myocardium voxels, per voxel.
+  3. Focal enhancement fraction: per patient, the fraction of myocardium voxels above
+     that patient's own myocardium mean + 5 SD.
+
+Output: <output_dir>/myocardium_intensity_comparison_normalized.png
+"""
+
 import sys
 import os
 import re
